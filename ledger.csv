@@ -1,0 +1,4 @@
+ts,symbol,side,qty,fill_price,fee,note
+2025-09-26 16:00:00 EDT,AAPL,FLAT,1,255.46,0.01,"threshold=0.60, p_up=0.41"
+2025-09-26 16:00:00 EDT,AAPL,FLAT,1,255.46,0.01,"threshold=0.60, p_up=0.41"
+2025-09-26 16:00:00 EDT,AAPL,FLAT,1,255.46,0.01,"threshold=0.60, p_up=0.41"

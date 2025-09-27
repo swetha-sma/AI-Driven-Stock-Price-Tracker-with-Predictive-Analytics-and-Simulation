@@ -1,0 +1,1 @@
+{"ticker": "AAPL", "features": ["ret1", "ret3", "ret6", "ema5", "ema20", "rsi14", "range", "vol5"], "interval_used": "15m", "period_used": "30d", "samples_total": 766, "holdout_accuracy": 0.45217391304347826}
