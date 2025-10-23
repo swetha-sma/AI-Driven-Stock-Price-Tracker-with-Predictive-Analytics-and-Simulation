@@ -1,5 +1,8 @@
 # AI-Driven-Stock-Price-Tracker-with-Predictive-Analytics-and-Simulation
 
+**Notion**
+https://www.notion.so/AI-Driven-Stock-Price-Tracker-with-Predictive-analysis-and-Simulation-29579a991ebf8026bcc3ecbd92078fa1?source=copy_link
+
 **Problem statement:**
 
 Tracking stock prices and learning how markets behave is often time-consuming and confusing for students, beginners, and casual traders.
