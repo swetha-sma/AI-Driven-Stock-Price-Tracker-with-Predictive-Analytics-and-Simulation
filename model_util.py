@@ -102,13 +102,41 @@ class ModelBundle:
 
 MODELS_DIR = "models"
 
+def _ticker_dir(ticker: str) -> str:
+    return os.path.join(MODELS_DIR, ticker.upper())
+
 def _paths(ticker: str):
-    t = ticker.upper()
-    return (
-        os.path.join(MODELS_DIR, f"{t}_model.pkl"),
-        os.path.join(MODELS_DIR, f"{t}_scaler.pkl"),
-        os.path.join(MODELS_DIR, f"{t}_meta.json"),
-    )
+    d = _ticker_dir(ticker)
+    mpath = os.path.join(d, "model.pkl")
+    spath = os.path.join(d, "scaler.pkl")
+    jpath = os.path.join(d, "meta.json")
+    return mpath, spath, jpath
+
+
+from datetime import datetime, timezone, timedelta
+
+def _file_age_hours(path: str) -> float:
+    try:
+        mtime = os.path.getmtime(path)
+        return (datetime.now(timezone.utc) - datetime.fromtimestamp(mtime, tz=timezone.utc)).total_seconds() / 3600.0
+    except Exception:
+        return 1e9  # very old if missing
+
+def _is_stale(meta_path: str, max_age_hours: int = 24) -> bool:
+    # Prefer meta.json timestamp; fallback to file mtime
+    try:
+        if os.path.exists(meta_path):
+            meta = json.load(open(meta_path))
+            ts = meta.get("trained_at")
+            if ts:
+                trained_at = datetime.fromisoformat(ts.replace("Z","+00:00"))
+                age = (datetime.now(timezone.utc) - trained_at).total_seconds() / 3600.0
+                return age > max_age_hours
+    except Exception:
+        pass
+    # If meta missing or unreadable, check file mtimes via _file_age_hours
+    return _file_age_hours(meta_path) > max_age_hours
+
 
 # ---------- Train (with simple fallbacks) ----------
 def train_for_ticker(ticker: str) -> Optional[ModelBundle]:
@@ -145,9 +173,9 @@ def train_for_ticker(ticker: str) -> Optional[ModelBundle]:
     clf = LogisticRegression(max_iter=200)
     clf.fit(Xtr_s, ytr)
     acc = float(accuracy_score(yte, clf.predict(Xte_s)))
-
-    os.makedirs(MODELS_DIR, exist_ok=True)
     mpath, spath, jpath = _paths(ticker)
+    os.makedirs(os.path.dirname(mpath), exist_ok=True)
+
     joblib.dump(clf, mpath)
     joblib.dump(scaler, spath)
     meta = {
@@ -157,6 +185,7 @@ def train_for_ticker(ticker: str) -> Optional[ModelBundle]:
         "period_used": used[1],
         "samples_total": int(len(feats)),
         "holdout_accuracy": acc,
+        "trained_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     with open(jpath, "w") as f:
         json.dump(meta, f)
@@ -164,18 +193,22 @@ def train_for_ticker(ticker: str) -> Optional[ModelBundle]:
     return ModelBundle(clf=clf, scaler=scaler, feats=FEATS, meta=meta)
 
 # ---------- Load (with auto-train) ----------
-def load_or_train_model(ticker: str) -> Optional[ModelBundle]:
+def load_or_train_model(ticker: str, max_age_hours: int = 24) -> Optional[ModelBundle]:
     mpath, spath, jpath = _paths(ticker)
-    if os.path.exists(mpath) and os.path.exists(spath) and os.path.exists(jpath):
+
+    # If all files exist and model is fresh, load it
+    if os.path.exists(mpath) and os.path.exists(spath) and os.path.exists(jpath) and not _is_stale(jpath, max_age_hours):
         try:
             clf = joblib.load(mpath)
             scaler = joblib.load(spath)
             meta = json.load(open(jpath))
             return ModelBundle(clf=clf, scaler=scaler, feats=meta.get("features", FEATS), meta=meta)
         except Exception:
-            pass
-    # train on the fly if not present
+            pass  # fall through to retrain
+
+    # Otherwise: (missing or stale) → train fresh
     return train_for_ticker(ticker)
+
 
 # ---------- Predict last bar for a ticker ----------
 def predict_next_prob_up(ticker: str, bundle: ModelBundle) -> Tuple[float, dict]:

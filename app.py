@@ -1,8 +1,7 @@
 # app.py — PricePal: live quotes (Finnhub) + simple 5m hint (Yahoo) + paper trades + RAG Q&A
-import os, time, re, subprocess, sys
+import os, time, re
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from model_util import load_or_train_model, predict_next_prob_up
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -12,17 +11,61 @@ import numpy as np
 import joblib
 import json
 
+# Model utils
+from model_util import load_or_train_model, predict_next_prob_up
+from model_util import load_candles
+
+def predict_next_price_point(ticker: str, bundle) -> tuple[float|None, float|None, dict]:
+    """
+    Returns (predicted_price, p_up, meta dict). If not enough data, returns (None, None, {...}).
+    Method: expected log-return = (2*p_up - 1) * mean(|ret1| of recent window),
+            next_price = last * exp(expected_log_return).
+    """
+    try:
+        interval = bundle.meta.get("interval_used","5m")
+        period   = {"5m":"5d","15m":"30d","1d":"1y"}.get(interval,"5d")
+
+        df = load_candles(ticker, period=period, interval=interval)
+        if df.empty or len(df) < 30:
+            return None, None, {"err":"few_candles"}
+
+        # probability from your classifier
+        p_up, ctx = predict_next_prob_up(ticker, bundle)
+
+        # recent volatility proxy from log returns
+        df = df.sort_values("ts").copy()
+        df["ret1"] = np.log(df["close"]).diff(1)
+        recent = df["ret1"].dropna().tail(60)
+        if recent.empty:
+            return None, p_up, {"err":"no_recent_returns"}
+        mean_abs = float(recent.abs().mean())
+
+        last = float(df["close"].iloc[-1])
+        exp_logret = (2.0 * float(p_up) - 1.0) * mean_abs
+        pred_price = last * np.exp(exp_logret)
+
+        meta = {
+            "interval": interval,
+            "period": period,
+            "mean_abs_ret": mean_abs,
+            "last_price": last
+        }
+        return pred_price, p_up, meta
+    except Exception as e:
+        return None, None, {"err": str(e)}
+
+
 # RAG imports
 import chromadb
 from chromadb.utils import embedding_functions
-from textwrap import shorten
+from rag_build import build_index  # <- dynamic per-ticker rebuild
 
 # --------------- Setup ---------------
 load_dotenv()
 API_KEY = os.getenv("FINNHUB_API_KEY")
 
-st.set_page_config(page_title="PricePal — Prices, 5m Hint & RAG", layout="wide")
-st.title("PricePal — Live Prices, Simple 5-Minute Hint, and RAG Q&A")
+st.set_page_config(page_title="PricePal — Stocks Chat & Tools", layout="wide")
+st.title("PricePal — Stocks Chat & Tools")
 
 if not API_KEY:
     st.error("FINNHUB_API_KEY not found in .env. Add `FINNHUB_API_KEY=...` and restart.")
@@ -69,7 +112,6 @@ def search_symbols(query: str):
             desc = it.get("description", "")
             exh = it.get("exchange", "")
             typ = it.get("type", "")
-            # keep common US equity/ETF types for a clean demo
             if typ in ("Common Stock", "ETF", "ETP", "ADR") and sym and desc:
                 clean.append({"symbol": sym, "desc": desc, "exchange": exh})
         return clean[:10]
@@ -81,14 +123,11 @@ def resolve_to_symbols(user_text: str):
     q = user_text.strip()
     if not q:
         return []
-    import re
     typed = [t.strip().upper().lstrip("$") for t in re.split(r"[,\s]+", q) if t.strip()]
     if typed and all(1 <= len(t) <= 5 and t.isalnum() for t in typed):
         # Looks like pure tickers already
         return [{"symbol": t, "desc": "", "exchange": ""} for t in typed]
-    # Otherwise, search by name
     return search_symbols(q)
-
 
 # --------------- Feature functions (must match train.py) ---------------
 def ema(series, span):
@@ -121,7 +160,6 @@ except Exception:
     MODEL_READY = False
 
 # --------------- RAG: client + retrieval helpers ---------------
-# Persistent Chroma client pointing to rag_store you built
 try:
     _chroma_client = chromadb.PersistentClient(path="rag_store")
     _embedder = embedding_functions.SentenceTransformerEmbeddingFunction(
@@ -134,23 +172,53 @@ try:
     )
 except Exception as e:
     _docs = None
-    st.warning(f"RAG store not available yet ({e}). Build it via the sidebar 'Rebuild RAG Index' or run rag_build.py.")
+    st.warning(f"RAG store not available yet ({e}). Build it via the sidebar below or run rag_build.py.")
+
+def resolve_ticker_for_question(q: str) -> str | None:
+    words = re.findall(r"[A-Za-z0-9]+", q.lower())
+    name_map = {
+        "apple":"AAPL","aapl":"AAPL",
+        "tesla":"TSLA","tsla":"TSLA",
+        "microsoft":"MSFT","msft":"MSFT",
+        "google":"GOOGL","alphabet":"GOOGL","googl":"GOOGL",
+        "amazon":"AMZN","amzn":"AMZN",
+        "nvidia":"NVDA","nvda":"NVDA","nvdia":"NVDA","nvida":"NVDA","nvidea":"NVDA",
+        "meta":"META","facebook":"META",
+        "netflix":"NFLX","adobe":"ADBE","intel":"INTC"
+    }
+    for w in words:
+        if w in name_map:
+            return name_map[w]
+
+    det = detect_tickers(q)
+    if det:
+        return det[0]
+
+    try:
+        opts = search_symbols(q)
+        if opts:
+            return opts[0]["symbol"]
+    except Exception:
+        pass
+    return None
+
 
 def detect_tickers(text: str):
-    """Very simple ticker extractor: 'AAPL', 'MSFT', '$NVDA' -> ['AAPL', 'MSFT', 'NVDA']"""
-    raw = re.findall(r"\$?[A-Z]{1,5}", text.upper())
-    return list({r.lstrip("$") for r in raw})
+    raw = re.findall(r"\$?[A-Z]{2,5}", text.upper())  # min len 2
+    blacklist = {"LATEST","WHAT","NEWS","ABOUT","STOCK","COMPANY","PRICE","PRICES","EARNINGS"}
+    return list({r.lstrip("$") for r in raw if r not in blacklist})
 
 def retrieve_chunks(question: str, k: int = 5, filter_by_tickers=True):
     """Query Chroma with optional ticker filter; return list of dicts: {text, meta, score}."""
     if _docs is None:
         return []
-    where = {}
+    where = None
     if filter_by_tickers:
         tickers = detect_tickers(question)
         if tickers:
-            where = {"$or": [{"ticker": t} for t in tickers]}
-    res = _docs.query(query_texts=[question], n_results=k, where=where or None)
+            # Use $in to match any of the detected tickers
+            where = {"ticker": {"$in": tickers}}
+    res = _docs.query(query_texts=[question], n_results=k, where=where)
     out = []
     for text, meta, score in zip(res.get("documents", [[]])[0],
                                  res.get("metadatas", [[]])[0],
@@ -182,7 +250,6 @@ def compose_answer_from_chunks(question: str, chunks: list, max_points: int = 5,
     if not bullets:
         return "I don’t have enough information in my notes to answer that confidently.", []
 
-    # enforce ~120-word cap
     words = " ".join(bullets).split()
     if len(words) > max_words:
         kept, count = [], 0
@@ -199,96 +266,22 @@ def compose_answer_from_chunks(question: str, chunks: list, max_points: int = 5,
     titles = list({(ch["meta"] or {}).get("title") for ch in chunks if (ch["meta"] or {}).get("title")})
     return answer, titles
 
-
-# ========== SIDEBAR: Utilities ==========
-with st.sidebar:
-    st.header("Utilities")
-    # Reset paper ledger
-    if st.button("Reset paper ledger"):
-        try:
-            if os.path.exists("ledger.csv"):
-                os.remove("ledger.csv")
-                st.success("Ledger reset.")
-            else:
-                st.info("No ledger found to reset.")
-        except Exception as e:
-            st.error(f"Could not reset ledger: {e}")
-
-    # Rebuild RAG index (runs rag_build.py)
-    if st.button("Rebuild RAG Index"):
-        try:
-            # Use the same interpreter/venv to run the script
-            cmd = [sys.executable, "rag_build.py"]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            if proc.returncode == 0:
-                st.success("RAG index rebuilt successfully.")
-                st.caption(proc.stdout or "Done.")
-            else:
-                st.error("Failed to rebuild RAG index.")
-                st.code(proc.stderr or proc.stdout)
-        except Exception as e:
-            st.error(f"Error while rebuilding index: {e}")
-
-# ========== Top: highlight card (AAPL live) ==========
-try:
-    aapl, _ = get_quote("AAPL")
-    price = aapl.get("c"); change = aapl.get("d"); pct = aapl.get("dp"); ts = aapl.get("t")
-except Exception as e:
-    st.error(f"Could not fetch AAPL price: {e}")
-    st.stop()
-
-c1, c2 = st.columns([1,1])
-with c1:
-    st.subheader("AAPL Price (live)")
-    st.metric("AAPL", f"${price:,.2f}" if price else "—",
-              f"{change:+.2f} ({pct:+.2f}%)" if change is not None and pct is not None else None)
-with c2:
-    st.write(f"**Last update:** {fmt_time_unix_to_et(ts)}")
-
-st.divider()
+    st.subheader("Rebuild RAG (per ticker)")
+    _rebuild_ticker = st.text_input("Ticker for RAG index (e.g., AAPL)", value="AAPL")
+    _days = st.slider("Days of news to ingest", 3, 21, 7, 1)
+    if st.button("Rebuild RAG Index (this ticker only)"):
+        if _rebuild_ticker.strip():
+            with st.spinner(f"Rebuilding index for {_rebuild_ticker.upper()} …"):
+                summary = build_index(watchlist=[_rebuild_ticker.upper()], days=_days)
+            st.success(f"Indexed {summary['docs_indexed']} records for {', '.join(summary['tickers'])}")
+        else:
+            st.warning("Enter a ticker first.")
 
 
-st.subheader("Search any stock price")
 
-qcol1, qcol2 = st.columns([3,1])
-qtext = qcol1.text_input("Type a company name or ticker (e.g., Apple, NVDA, MSFT)", value="Apple")
-limit = qcol2.slider("Max results", 1, 10, 5)
 
-if st.button("Search"):
-    candidates = resolve_to_symbols(qtext)[:limit]
-    if not candidates:
-        st.info("No matches found. Try a different name or ticker.")
-    else:
-        labels = [f"{c['symbol']} — {c['desc'] or 'No description'} ({c['exchange']})" for c in candidates]
-        sel = st.multiselect("Select symbols to show:", labels, default=labels[:min(3, len(labels))])
-        chosen = [lbl.split(" — ")[0].strip() for lbl in sel]
-
-        rows, errors = [], []
-        for s in chosen:
-            try:
-                q, cached = get_quote(s)
-                price = q.get("c")
-                if not price:
-                    errors.append(s); continue
-                rows.append({
-                    "Symbol": s,
-                    "Price": f"${price:,.2f}",
-                    "Δ": f"{q.get('d', 0.0):+.2f}",
-                    "Δ%": f"{q.get('dp', 0.0):+.2f}%",
-                    "Last update (ET)": fmt_time_unix_to_et(q.get("t", 0)),
-                    "Source": "cache" if cached else "live"
-                })
-            except Exception as e:
-                errors.append(f"{s} ({e})")
-
-        if rows:
-            st.dataframe(rows, use_container_width=True, hide_index=True)
-        if errors:
-            st.warning("Skipped: " + ", ".join(errors))
-            
-# ========== Middle: multi-ticker price table ==========
-st.subheader("Check multiple tickers at once")
-
+# -------- Multi-ticker price table --------
+st.subheader("Check stock prices - Multiple Tickers")
 left, right = st.columns([2,1])
 with left:
     user_text = st.text_input("Type tickers (e.g., AAPL MSFT NVDA):", value="AAPL MSFT NVDA")
@@ -322,18 +315,14 @@ if st.button("Get Prices", type="primary"):
         st.dataframe(rows, use_container_width=True, hide_index=True)
     else:
         st.info("No valid quotes returned.")
-
     if errors:
         st.warning("Skipped/invalid: " + ", ".join(errors))
 
 st.caption("Source: Finnhub (free tier). Uses a small cache (~45s) to respect rate limits.")
-
 st.divider()
 
-# ========== Bottom: Simple 5-minute hint (AAPL, via Yahoo) + paper trade ==========
-st.divider()
+# -------- Predict next move + paper trade --------
 st.subheader("Predict next move (any ticker)")
-
 pc1, pc2, pc3 = st.columns([1.2, 1, 1])
 ticker_in = pc1.text_input("Ticker", value="AAPL").upper().strip()
 threshold = pc2.slider("Confidence needed for LONG", 0.50, 0.65, 0.55, 0.01)
@@ -355,77 +344,183 @@ if go:
         c4.metric("Holdout acc.", f"{bundle.meta.get('holdout_accuracy', 0):.2f}")
         st.caption(f"Interval used: {bundle.meta['interval_used']} | Period: {bundle.meta['period_used']} | Samples: {bundle.meta['samples_total']}")
 
-    # ---- Paper trade (pretend) ----
-    st.markdown("### Paper trade (pretend)")
-    if st.button("Simulate next trade (AAPL, 1 share)"):
-        q_now, _ = get_quote("AAPL")
-        fill_price = float(q_now.get("c", 0.0)) or 0.0
-        side = "BUY" if action == "LONG" else "FLAT"
-        fee = 0.01  # simple fixed fee
-        ts_now = fmt_time_unix_to_et(q_now.get("t", 0))
+        st.divider()
 
-        row = {
-            "ts": ts_now, "symbol": "AAPL", "side": side, "qty": 1,
-            "fill_price": fill_price, "fee": fee,
-            "note": f"threshold={threshold:.2f}, p_up={p_up:.2f}" if 'p_up' in locals() else "no_prob"
-        }
-        if os.path.exists("ledger.csv"):
-            old = pd.read_csv("ledger.csv")
-            new = pd.concat([old, pd.DataFrame([row])], ignore_index=True)
-            new.to_csv("ledger.csv", index=False)
-        else:
-            pd.DataFrame([row]).to_csv("ledger.csv", index=False)
-        st.success(f"Logged paper trade: {side} 1 AAPL @ ${fill_price:.2f}")
+# ---- Local LLM via Ollama (Phi-3 Mini) ----
+try:
+    import ollama
+except Exception as e:
+    ollama = None
+    st.warning(f"Ollama client not available: {e}. Start Ollama or run `pip install ollama`.")
 
-    st.markdown("#### Recent paper trades")
-    if os.path.exists("ledger.csv"):
-        led = pd.read_csv("ledger.csv")
-        st.dataframe(led.tail(12), use_container_width=True, hide_index=True)
-    else:
-        st.info("No trades yet. Click the button above to log your first pretend trade.")
 
-st.caption("Built for learning: live quotes via Finnhub; 5-minute candles via Yahoo; paper trades only (no real money).")
+def local_llm_answer(prompt: str, model: str = "phi3:mini") -> str:
+    """
+    Sends a prompt to a local Ollama model and returns the response text.
+    Make sure Ollama is running (http://localhost:11434).
+    """
+    if ollama is None:
+        return "(Local model unavailable. Is Ollama running? Try `ollama run phi3:mini ...` in a terminal.)"
 
+    try:
+        stream = ollama.chat(model=model, messages=[
+            {"role": "system", "content": "You are a helpful stock assistant. Answer concisely and use plain English."},
+            {"role": "user", "content": prompt}
+        ])
+        return stream["message"]["content"].strip()
+    except Exception as e:
+        return f"(Local model error: {e})"
+
+
+# ======================= Chatbot (multi-turn) =======================
+# ======================= Chatbot (multi-turn) =======================
 st.divider()
+st.subheader("Chatbot — Stocks & Companies (RAG)")
 
-# ========== RAG Q&A ==========
-st.subheader("Ask a company question (RAG from your docs)")
+# Keep multi-turn chat history
+if "chat" not in st.session_state:
+    st.session_state.chat = []
+if "last_ticker" not in st.session_state:
+    st.session_state.last_ticker = None
 
-colq1, colq2 = st.columns([3,1])
-question = colq1.text_input(
-    "Ask in plain English (e.g., 'What does NVDA do?' or 'AAPL overview'):",
-    value="What does AAPL do?"
-)
-filter_by_tickers = colq2.toggle(
-    "Filter by detected tickers",
-    value=True,
-    help="Limits retrieval to docs tagged with tickers found in your question."
-)
+# Render history
+for m in st.session_state.chat:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
 
-if st.button("Ask (RAG)"):
-    with st.spinner("Searching your notes…"):
-        hits = retrieve_chunks(question, k=5, filter_by_tickers=filter_by_tickers)
-        if not hits:
-            st.info("No relevant notes found. Add docs to ./docs and click 'Rebuild RAG Index' in the sidebar.")
-        else:
-            answer, sources = compose_answer_from_chunks(question, hits, max_points=5)
-            st.write(answer)
+user_msg = st.chat_input("Ask about any stock/company (e.g., 'What is Tesla?' or 'Predict NVDA next move')")
+
+if not user_msg:
+    # nothing to do on this rerun, keep rest of the page rendering
+    pass
+else:
+    st.session_state.chat.append({"role": "user", "content": user_msg})
+    with st.chat_message("user"):
+        st.markdown(user_msg)
+
+    # Decide the main ticker for this turn
+    ticker = resolve_ticker_for_question(user_msg) or st.session_state.last_ticker
+    st.session_state.last_ticker = ticker
+
+    # Mode: predict vs info-only
+    q_lower = user_msg.lower()
+    predict_keywords = ("predict", "next move", "forecast", "estimate", "target", "probability")
+    is_predict = any(k in q_lower for k in predict_keywords)
+
+    with st.spinner("Thinking…"):
+        # 1) Retrieve RAG context (auto-ingest if empty and we have a ticker)
+        hits = retrieve_chunks(user_msg, k=5, filter_by_tickers=True)
+        if not hits and ticker:
+            try:
+                build_index(watchlist=[ticker], days=7)
+                hits = retrieve_chunks(user_msg, k=5, filter_by_tickers=True)
+            except Exception as e:
+                st.warning(f"Could not ingest news for {ticker}: {e}")
+
+        context = "\n\n".join(ch["text"] for ch in hits[:6]) if hits else "(no context)"
+
+        # 2) Live price (Finnhub)
+        last_px = chg = chg_pct = None
+        try:
+            if ticker:
+                qnow, _ = get_quote(ticker)
+                last_px = qnow.get("c")
+                chg, chg_pct = qnow.get("d"), qnow.get("dp")
+        except Exception:
+            pass
+
+        # 3) If predict mode, compute model probability + short-term estimate
+        p_up = pred_px = None
+        interval_used = None
+        if is_predict and ticker:
+            try:
+                bundle = load_or_train_model(ticker)
+                if bundle:
+                    interval_used = bundle.meta.get("interval_used", "5m")
+                    pred_px, p_up, _meta = predict_next_price_point(ticker, bundle)
+            except Exception:
+                pass
+
+        # 4) Ask local LLM for very short bullets (overview only)
+        prompt = (
+            "You are a concise stock analysis assistant.\n"
+            "ANSWER RULES (follow exactly):\n"
+            "- NO paragraphs.\n"
+            "- Use short bullet points only.\n"
+            "- Max 2 bullets for OVERVIEW.\n"
+            "- If context is weak: say 'Context limited.'\n\n"
+            "FORMAT (follow exactly):\n"
+            "OVERVIEW:\n"
+            "- bullet\n"
+            "- bullet\n\n"
+            f"USER QUESTION:\n{user_msg}\n\n"
+            f"CONTEXT:\n{context}"
+        )
+        llm_sections = local_llm_answer(prompt)
+
+    # ---------- Build short reply ----------
+    def _extract_bullets(llm_text: str):
+        items = []
+        for line in (llm_text or "").splitlines():
+            s = line.strip()
+            if s.startswith(("-", "•")):
+                items.append(s.lstrip("-• ").strip())
+        return items
+
+    overview = _extract_bullets(llm_sections)[:2] or ["Context limited."]
+
+    # Clean price line
+    if last_px is not None:
+        price_line = f"**Current Price:** ${float(last_px):,.2f}"
+        if chg is not None and chg_pct is not None:
+            price_line += f" ({float(chg):+,.2f}, {float(chg_pct):+,.2f}%)"
+    else:
+        price_line = "**Current Price:** Not available"
+
+    with st.chat_message("assistant"):
+        # Always show overview bullets
+        st.markdown("**Company Overview (RAG):**")
+        st.markdown("\n".join(f"- {o}" for o in overview))
+
+        # Always show current price
+        st.markdown(price_line)
+
+        # Only if predict mode: show probability + estimate
+        if is_predict:
+            c1, c2 = st.columns(2)
+            if p_up is not None:
+                direction = "UP" if p_up >= 0.5 else "DOWN"
+                c1.metric("Next Move Probability", f"{int(round(p_up*100))}%", direction)
+            else:
+                c1.metric("Next Move Probability", "—")
+            if pred_px is not None:
+                c2.metric(f"Short-Term Estimate (next {interval_used or '15m'})", f"${float(pred_px):,.2f}")
+            else:
+                c2.metric("Short-Term Estimate", "—")
+
+        # Always show retrieved chunks
+        if hits:
             links = []
             for h in hits:
-                m = h.get("meta") or {}
-                title = m.get("title")
-                url   = m.get("url")
+                meta = h.get("meta") or {}
+                title = meta.get("title"); url = meta.get("url")
                 if title and title not in links:
-                    if url:
-                        links.append(f"[{title}]({url})")
-                    else:
-                        links.append(title)
+                    links.append(f"[{title}]({url})" if url else title)
             if links:
                 st.markdown("**Sources:** " + " • ".join(links))
+
             with st.expander("Show retrieved chunks"):
                 for i, h in enumerate(hits, 1):
                     meta = h.get("meta") or {}
                     st.markdown(f"**{i}. {meta.get('title','(untitled)')}** — ticker: {meta.get('ticker','GEN')}")
                     st.write(h["text"])
 
-st.caption("RAG answers come from your local notes (./docs → rag_build.py → ./rag_store). Education only — not financial advice.")
+    # Push a compact, single-line summary into history (for the scroll)
+    compact = f"Overview: {', '.join(overview)}"
+    if last_px is not None:
+        compact += f" | Price: ${float(last_px):,.2f}"
+    if is_predict and (p_up is not None):
+        compact += f" | P(up): {int(round(p_up*100))}%"
+    if is_predict and (pred_px is not None):
+        compact += f" | Est: ${float(pred_px):,.2f}"
+    st.session_state.chat.append({"role": "assistant", "content": compact})

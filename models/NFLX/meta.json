@@ -1,0 +1,1 @@
+{"ticker": "NFLX", "features": ["ret1", "ret3", "ret6", "ema5", "ema20", "rsi14", "range", "vol5"], "interval_used": "15m", "period_used": "30d", "samples_total": 758, "holdout_accuracy": 0.4956140350877193, "trained_at": "2025-10-25T17:59:50.504032Z"}

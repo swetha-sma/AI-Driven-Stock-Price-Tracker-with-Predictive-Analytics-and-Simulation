@@ -1,0 +1,1 @@
+{"ticker": "ADBE", "features": ["ret1", "ret3", "ret6", "ema5", "ema20", "rsi14", "range", "vol5"], "interval_used": "15m", "period_used": "30d", "samples_total": 766, "holdout_accuracy": 0.48695652173913045, "trained_at": "2025-10-25T12:20:29.436329Z"}
