@@ -1,4 +1,4 @@
-# AI-Driven-Stock-Price-Tracker-with-Predictive-Analytics-and-Simulation
+# RAG Based Stock Market Assistant
 
 **Notion**
 https://www.notion.so/AI-Driven-Stock-Price-Tracker-with-Predictive-analysis-and-Simulation-29579a991ebf8026bcc3ecbd92078fa1?source=copy_link
